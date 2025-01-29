@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("RandomPasswordAPIProject")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c0e82c686525020d0a56c768a129bc1a11286715")]
 [assembly: System.Reflection.AssemblyProductAttribute("RandomPasswordAPIProject")]
 [assembly: System.Reflection.AssemblyTitleAttribute("RandomPasswordAPIProject")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
