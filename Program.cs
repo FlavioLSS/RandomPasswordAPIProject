@@ -3,12 +3,10 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.OpenApi.Models;
 using System.ComponentModel.DataAnnotations;
 using System.Security.Cryptography;
+using Microsoft.EntityFrameworkCore;
 
 namespace RandomPasswordAPI;
 
-/// <summary>
-/// Configuração das opções de geração de senha
-/// </summary>
 public sealed record PasswordOptions
 {
     public const int MinLength = 8;
@@ -26,9 +24,46 @@ public sealed record PasswordOptions
     public bool ExcludeAmbiguousChars { get; init; } = false;
 }
 
-/// <summary>
-/// Representa uma senha gerada e suas características
-/// </summary>
+// Entidade para armazenar o histórico de senhas
+public sealed class PasswordHistory
+{
+    public int Id { get; set; }
+    public required string Password { get; set; }
+    public DateTime Timestamp { get; set; }
+    public int Entropy { get; set; }
+    public required string Strength { get; set; }
+    public required string CharacterAnalysis { get; set; }
+    public required string GenerationOptions { get; set; }
+    public bool IsAnalysisOnly { get; set; }
+    public string? IpAddress { get; set; }
+    public string? UserAgent { get; set; }
+}
+
+public sealed class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    
+    public DbSet<PasswordHistory> PasswordHistories { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<PasswordHistory>()
+            .HasIndex(p => p.Timestamp);
+
+        modelBuilder.Entity<PasswordHistory>()
+            .Property(p => p.Password)
+            .HasMaxLength(128);
+
+        modelBuilder.Entity<PasswordHistory>()
+            .Property(p => p.CharacterAnalysis)
+            .HasMaxLength(1000);
+
+        modelBuilder.Entity<PasswordHistory>()
+            .Property(p => p.GenerationOptions)
+            .HasMaxLength(1000);
+    }
+}
+
 public sealed record PasswordResponse
 {
     public required string Password { get; init; }
@@ -38,24 +73,12 @@ public sealed record PasswordResponse
     public required Dictionary<string, int> CharacterAnalysis { get; init; }
 }
 
-/// <summary>
-/// Serviço responsável pela geração de senhas seguras
-/// </summary>
 public interface IPasswordGeneratorService
 {
-    /// <summary>
-    /// Gera uma senha aleatória com base nas opções fornecidas
-    /// </summary>
-    /// <param name="options">Opções de configuração da senha</param>
-    /// <returns>Senha gerada e suas características</returns>
-    PasswordResponse GeneratePassword(PasswordOptions options);
-
-    /// <summary>
-    /// Avalia a força de uma senha existente
-    /// </summary>
-    /// <param name="password">Senha a ser avaliada</param>
-    /// <returns>Análise da senha</returns>
-    PasswordResponse AnalyzePassword(string password);
+    Task<PasswordResponse> GeneratePasswordAsync(PasswordOptions options, string? ipAddress = null, string? userAgent = null);
+    Task<PasswordResponse> AnalyzePasswordAsync(string password, string? ipAddress = null, string? userAgent = null);
+    Task<IEnumerable<PasswordHistory>> GetPasswordHistoryAsync(DateTime? startDate = null, DateTime? endDate = null);
+    Task<Dictionary<string, int>> GetPasswordStrengthStatsAsync();
 }
 
 public sealed class PasswordGeneratorService : IPasswordGeneratorService
@@ -67,7 +90,86 @@ public sealed class PasswordGeneratorService : IPasswordGeneratorService
     private static readonly char[] SimilarChars = "il1Lo0O".ToCharArray();
     private static readonly char[] AmbiguousChars = "{}[]()/\\'\"`~,;:.<>".ToCharArray();
 
-    public PasswordResponse GeneratePassword(PasswordOptions options)
+    private readonly AppDbContext _context;
+
+    public PasswordGeneratorService(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<PasswordResponse> GeneratePasswordAsync(PasswordOptions options, string? ipAddress = null, string? userAgent = null)
+    {
+        var response = GeneratePassword(options);
+        
+        var history = new PasswordHistory
+        {
+            Password = response.Password,
+            Timestamp = response.Timestamp,
+            Entropy = response.Entropy,
+            Strength = response.Strength,
+            CharacterAnalysis = System.Text.Json.JsonSerializer.Serialize(response.CharacterAnalysis),
+            GenerationOptions = System.Text.Json.JsonSerializer.Serialize(options),
+            IsAnalysisOnly = false,
+            IpAddress = ipAddress,
+            UserAgent = userAgent
+        };
+
+        await _context.PasswordHistories.AddAsync(history);
+        await _context.SaveChangesAsync();
+
+        return response;
+    }
+
+    public async Task<PasswordResponse> AnalyzePasswordAsync(string password, string? ipAddress = null, string? userAgent = null)
+    {
+        var response = AnalyzePassword(password);
+
+        var history = new PasswordHistory
+        {
+            Password = response.Password,
+            Timestamp = response.Timestamp,
+            Entropy = response.Entropy,
+            Strength = response.Strength,
+            CharacterAnalysis = System.Text.Json.JsonSerializer.Serialize(response.CharacterAnalysis),
+            GenerationOptions = "{}",
+            IsAnalysisOnly = true,
+            IpAddress = ipAddress,
+            UserAgent = userAgent
+        };
+
+        await _context.PasswordHistories.AddAsync(history);
+        await _context.SaveChangesAsync();
+
+        return response;
+    }
+
+    public async Task<IEnumerable<PasswordHistory>> GetPasswordHistoryAsync(DateTime? startDate = null, DateTime? endDate = null)
+    {
+        var query = _context.PasswordHistories.AsQueryable();
+
+        if (startDate.HasValue)
+            query = query.Where(p => p.Timestamp >= startDate.Value);
+
+        if (endDate.HasValue)
+            query = query.Where(p => p.Timestamp <= endDate.Value);
+
+        return await query
+            .OrderByDescending(p => p.Timestamp)
+            .Take(1000)
+            .ToListAsync();
+    }
+
+    public async Task<Dictionary<string, int>> GetPasswordStrengthStatsAsync()
+    {
+        var stats = await _context.PasswordHistories
+            .GroupBy(p => p.Strength)
+            .Select(g => new { Strength = g.Key, Count = g.Count() })
+            .ToListAsync();
+
+        return stats.ToDictionary(x => x.Strength, x => x.Count);
+    }
+
+    private PasswordResponse GeneratePassword(PasswordOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -97,19 +199,16 @@ public sealed class PasswordGeneratorService : IPasswordGeneratorService
         if (options.IncludeNumbers) password.Append(GetRandomChar(NumberChars, rng, bytes));
         if (options.IncludeSpecialChars) password.Append(GetRandomChar(SpecialChars, rng, bytes));
 
-        // Completa o resto da senha com caracteres aleatórios
         while (password.Length < options.Length)
         {
             password.Append(GetRandomChar(availableChars.ToArray(), rng, bytes));
         }
 
-        // Embaralha a senha final
         var finalPassword = new string(password.ToString().OrderBy(_ => GetRandomInt(rng, bytes)).ToArray());
-        
         return CreatePasswordResponse(finalPassword);
     }
 
-    public PasswordResponse AnalyzePassword(string password)
+    private PasswordResponse AnalyzePassword(string password)
     {
         ArgumentException.ThrowIfNullOrEmpty(password);
         return CreatePasswordResponse(password);
@@ -172,9 +271,6 @@ public sealed class PasswordGeneratorService : IPasswordGeneratorService
     };
 }
 
-/// <summary>
-/// Controlador para operações relacionadas a senhas
-/// </summary>
 [ApiController]
 [Route("api/[controller]")]
 public sealed class PasswordController : ControllerBase
@@ -188,20 +284,18 @@ public sealed class PasswordController : ControllerBase
         _logger = logger;
     }
 
-    /// <summary>
-    /// Gera uma nova senha aleatória
-    /// </summary>
-    /// <param name="options">Opções de geração da senha</param>
-    /// <returns>Senha gerada e suas características</returns>
     [HttpGet("generate")]
     [ProducesResponseType(typeof(PasswordResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public IActionResult GeneratePassword([FromQuery] PasswordOptions options)
+    public async Task<IActionResult> GeneratePassword([FromQuery] PasswordOptions options)
     {
         try
         {
             _logger.LogInformation("Gerando senha com opções: {@Options}", options);
-            var response = _passwordGenerator.GeneratePassword(options);
+            var ipAddress = HttpContext.Connection.RemoteIpAddress?.ToString();
+            var userAgent = HttpContext.Request.Headers.UserAgent.ToString();
+            
+            var response = await _passwordGenerator.GeneratePasswordAsync(options, ipAddress, userAgent);
             return Ok(response);
         }
         catch (Exception ex)
@@ -211,20 +305,18 @@ public sealed class PasswordController : ControllerBase
         }
     }
 
-    /// <summary>
-    /// Analisa a força de uma senha existente
-    /// </summary>
-    /// <param name="password">Senha a ser analisada</param>
-    /// <returns>Análise da senha</returns>
     [HttpPost("analyze")]
     [ProducesResponseType(typeof(PasswordResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public IActionResult AnalyzePassword([FromBody] string password)
+    public async Task<IActionResult> AnalyzePassword([FromBody] string password)
     {
         try
         {
             _logger.LogInformation("Analisando senha");
-            var response = _passwordGenerator.AnalyzePassword(password);
+            var ipAddress = HttpContext.Connection.RemoteIpAddress?.ToString();
+            var userAgent = HttpContext.Request.Headers.UserAgent.ToString();
+            
+            var response = await _passwordGenerator.AnalyzePasswordAsync(password, ipAddress, userAgent);
             return Ok(response);
         }
         catch (Exception ex)
@@ -232,6 +324,24 @@ public sealed class PasswordController : ControllerBase
             _logger.LogError(ex, "Erro ao analisar senha");
             return BadRequest(new { error = ex.Message });
         }
+    }
+
+    [HttpGet("history")]
+    [ProducesResponseType(typeof(IEnumerable<PasswordHistory>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> GetPasswordHistory(
+        [FromQuery] DateTime? startDate,
+        [FromQuery] DateTime? endDate)
+    {
+        var history = await _passwordGenerator.GetPasswordHistoryAsync(startDate, endDate);
+        return Ok(history);
+    }
+
+    [HttpGet("stats")]
+    [ProducesResponseType(typeof(Dictionary<string, int>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> GetPasswordStats()
+    {
+        var stats = await _passwordGenerator.GetPasswordStrengthStatsAsync();
+        return Ok(stats);
     }
 }
 
@@ -241,72 +351,30 @@ public static class Program
     {
         var builder = WebApplication.CreateBuilder(args);
 
-        ConfigureServices(builder.Services);
+        ConfigureServices(builder.Services, builder.Configuration);
 
         var app = builder.Build();
 
         ConfigureMiddleware(app);
         ConfigureEndpoints(app);
 
+        // Aplica as migrações do banco de dados
+        using (var scope = app.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            dbContext.Database.Migrate();
+        }
+
         app.Run();
     }
 
-    private static void ConfigureServices(IServiceCollection services)
+    private static void ConfigureServices(IServiceCollection services, IConfiguration configuration)
     {
+        services.AddDbContext<AppDbContext>(options =>
+            options.UseSqlServer(
+                configuration.GetConnectionString("DefaultConnection"),
+                b => b.MigrationsAssembly("RandomPasswordAPI")));
+
         services.AddControllers();
         services.AddEndpointsApiExplorer();
-        services.AddSwaggerGen(c =>
-        {
-            c.SwaggerDoc("v1", new OpenApiInfo
-            {
-                Title = "Password Generator API",
-                Version = "v1",
-                Description = "API para geração e análise de senhas seguras",
-                Contact = new OpenApiContact
-                {
-                    Name = "Suporte",
-                    Email = "suporte@passwordapi.com"
-                }
-            });
-
-            var xmlFile = $"{System.Reflection.Assembly.GetExecutingAssembly().GetName().Name}.xml";
-            var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
-            c.IncludeXmlComments(xmlPath);
-        });
-
-        services.AddScoped<IPasswordGeneratorService, PasswordGeneratorService>();
-        
-        services.AddCors(options =>
-        {
-            options.AddPolicy("AllowAll", builder =>
-            {
-                builder.AllowAnyOrigin()
-                       .AllowAnyMethod()
-                       .AllowAnyHeader();
-            });
-        });
-
-        services.AddHealthChecks();
-        services.AddResponseCompression();
-    }
-
-    private static void ConfigureMiddleware(WebApplication app)
-    {
-        if (app.Environment.IsDevelopment())
-        {
-            app.UseSwagger();
-            app.UseSwaggerUI();
-        }
-
-        app.UseHttpsRedirection();
-        app.UseCors("AllowAll");
-        app.UseResponseCompression();
-        app.UseAuthorization();
-    }
-
-    private static void ConfigureEndpoints(WebApplication app)
-    {
-        app.MapControllers();
-        app.MapHealthChecks("/health");
-    }
-}
+        services.
